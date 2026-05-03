@@ -7,6 +7,7 @@ FastAPI service with:
   - Webshare proxy fallback on CAPTCHA/block detection
 """
 
+
 import asyncio
 import concurrent.futures
 import json as json_mod
@@ -29,6 +30,25 @@ import proxy_manager
 import amazon_pa
 import browser_pool
 import fingerprint_rotator
+
+# ── Proxy-first domains ──────────────────────────────────────────────────────
+# Indian e-commerce sites block datacenter IPs at the network level (Akamai/CF
+# WAF silently drops TCP connections from AWS/Azure/GCP ranges). Direct
+# requests to these sites waste 8s on a timeout that WILL fail. Proxy-first
+# skips the direct tier entirely and goes straight to residential proxy.
+ALWAYS_PROXY_DOMAINS = {
+    "amazon", "flipkart", "myntra", "jiomart", "meesho",
+    "nykaa", "tirabeauty", "ajio", "bigbasket", "beminimalist",
+    "1mg", "apollopharmacy", "croma", "tatacliq",
+}
+
+def needs_proxy_first(url: str) -> bool:
+    """Check if a URL's domain is known to block datacenter IPs."""
+    try:
+        host = urlparse(url).netloc.lower()
+        return any(d in host for d in ALWAYS_PROXY_DOMAINS)
+    except Exception:
+        return False
 
 # ─── App Setup ───────────────────────────────────────────────────────────────
 
@@ -501,30 +521,37 @@ async def scrape_url_async(url: str, timeout: int = 9) -> ScrapeResponse:
         _curl_session = AsyncSession(max_clients=60)
 
     # ── Tier 1: Direct async scrape ──────────────────────────────────────
-    try:
-        direct_timeout = min(timeout, 8)
-        response = await _curl_session.get(
-            url, headers=headers, impersonate=profile,
-            timeout=direct_timeout, allow_redirects=True, max_redirects=5,
-        )
-        html = response.text
-        success = response.status_code == 200 and len(html) > 100
+    # For known-blocked sites, skip direct (would waste 8s on a timeout)
+    # and go straight to proxy.
+    skip_direct = needs_proxy_first(url) and proxy_manager.is_available()
 
-        if success and not proxy_manager.is_blocked(response.status_code, html):
-            price, title = await run_in_threadpool(extract_price_from_html, html)
-            return ScrapeResponse(
-                url=url, status_code=response.status_code,
-                html=html, content_length=len(html),
-                success=success,
-                extracted_price=price,
-                extracted_title=title,
-                used_proxy=False,
+    if not skip_direct:
+        try:
+            direct_timeout = min(timeout, 8)
+            response = await _curl_session.get(
+                url, headers=headers, impersonate=profile,
+                timeout=direct_timeout, allow_redirects=True, max_redirects=5,
             )
+            html = response.text
+            success = response.status_code == 200 and len(html) > 100
 
-        print(f"[Scraper] 🛡️ Blocked (HTTP {response.status_code}): {url[:80]}")
+            if success and not proxy_manager.is_blocked(response.status_code, html):
+                price, title = await run_in_threadpool(extract_price_from_html, html)
+                return ScrapeResponse(
+                    url=url, status_code=response.status_code,
+                    html=html, content_length=len(html),
+                    success=success,
+                    extracted_price=price,
+                    extracted_title=title,
+                    used_proxy=False,
+                )
 
-    except Exception as e:
-        print(f"[Scraper] ⚠️ Direct failed: {url[:60]} — {str(e)[:80]}")
+            print(f"[Scraper] 🛡️ Blocked (HTTP {response.status_code}): {url[:80]}")
+
+        except Exception as e:
+            print(f"[Scraper] ⚠️ Direct failed: {url[:60]} — {str(e)[:80]}")
+    else:
+        print(f"[Scraper] ⏩ Proxy-first: {url[:60]}")
 
     # ── Tier 2 (Amazon only): PA API fallback ────────────────────────────
     if is_amazon and amazon_pa.is_configured():
@@ -558,6 +585,7 @@ async def scrape_url_async(url: str, timeout: int = 9) -> ScrapeResponse:
                 url, headers=headers, impersonate=profile,
                 timeout=proxy_timeout, allow_redirects=True, max_redirects=5,
                 proxy=proxy_url,
+                http_version=1,  # Force HTTP/1.1 — fixes 407 CONNECT tunnel
             )
             html = response.text
             success = response.status_code == 200 and len(html) > 100

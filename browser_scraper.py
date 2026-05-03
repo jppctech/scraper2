@@ -194,33 +194,35 @@ async def try_api_intercept(page, hostname: str, max_wait_ms: int = 4000) -> Opt
 # to be slow (JioMart) get a more generous cap. Anything not listed here
 # falls back to `_DEFAULT_GOTO_TIMEOUT_MS`.
 _SITE_GOTO_TIMEOUTS_MS: dict[str, int] = {
-    "amazon":    8_000,
-    "flipkart":  8_000,
-    "myntra":   10_000,
-    "nykaa":     9_000,
-    "meesho":   10_000,
-    "jiomart":  12_000,
-    "bigbasket": 10_000,
-    "ajio":      9_000,
-    "tatacliq": 10_000,
-    "croma":     9_000,
+    "amazon":          8_000,
+    "flipkart":       12_000,   # "commit" is fast; the budget covers selector wait
+    "myntra":         10_000,
+    "nykaa":           9_000,
+    "meesho":         10_000,
+    "jiomart":        12_000,
+    "bigbasket":      10_000,
+    "ajio":            9_000,
+    "tatacliq":       10_000,
+    "croma":           9_000,
+    "tirabeauty":     15_000,   # networkidle needs more time
+    "apollopharmacy": 12_000,   # Angular hydration is slow
 }
-_DEFAULT_GOTO_TIMEOUT_MS = 12_000
+_DEFAULT_GOTO_TIMEOUT_MS = 20_000
 
 
 def get_site_timeout_ms(hostname: str, base_timeout: int) -> int:
     """
     Resolve the effective `page.goto` timeout for a given hostname.
 
-    Returns the SMALLER of the per-site cap and the caller's `base_timeout`
-    (in seconds, converted to ms). The caller's value still wins when it's
-    explicitly tightened — we only ever shorten, never lengthen.
+    Returns the LARGER of the per-site cap and the caller's `base_timeout`
+    (in seconds, converted to ms). Site-specific timeouts are tuned for
+    each domain's behaviour — they should not be shortened by the caller.
     """
     matched = next(
         (v for k, v in _SITE_GOTO_TIMEOUTS_MS.items() if k in hostname),
         _DEFAULT_GOTO_TIMEOUT_MS,
     )
-    return min(matched, base_timeout * 1000)
+    return max(matched, base_timeout * 1000)
 
 
 async def init_browser():
@@ -305,9 +307,37 @@ async def scrape_with_browser(url: str, timeout: int = 15) -> dict:
                     try_api_intercept(page, hostname, max_wait_ms=4000)
                 )
 
-            # Navigate. UA, viewport, locale, route handlers are all already
-            # set on the pooled context — no per-request setup overhead.
-            await page.goto(url, wait_until="domcontentloaded", timeout=goto_timeout_ms)
+            # Navigate. Per-domain wait_until strategy:
+            #   - "commit": for sites where price is in initial HTML (JSON-LD)
+            #   - "networkidle": for Next.js sites that fire a product API call
+            #   - "domcontentloaded": default, good for most sites
+            if "flipkart" in hostname:
+                # Flipkart needs CSS for IntersectionObserver — unblock it.
+                # CSS is blocked by default in the pool to speed up other sites.
+                if pp.cdp_session:
+                    try:
+                        await pp.cdp_session.send("Network.setBlockedURLs", {
+                            "urls": [
+                                "*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp", "*.svg",
+                                "*.woff", "*.woff2", "*.ttf", "*.eot", "*.ico",
+                                "*.mp4", "*.mp3",
+                                "*google-analytics*", "*googletagmanager*",
+                                "*facebook.net*", "*hotjar*", "*clarity*",
+                                "*doubleclick*", "*adsystem*",
+                            ]
+                        })
+                    except Exception:
+                        pass
+                await page.goto(url, wait_until="commit", timeout=goto_timeout_ms)
+                # Mark context for recycling — CSS was unblocked for this request
+                # and needs to be restored for the next non-Flipkart request.
+                pp.is_broken = True
+            elif "tirabeauty" in hostname:
+                # TiraBeauty (Next.js): price API fires after DOM ready.
+                # networkidle waits for all network requests to settle.
+                await page.goto(url, wait_until="networkidle", timeout=goto_timeout_ms)
+            else:
+                await page.goto(url, wait_until="domcontentloaded", timeout=goto_timeout_ms)
 
             # If the API intercept already won the race, we can short-circuit
             # the entire DOM-wait + extraction phase.
@@ -364,8 +394,9 @@ async def scrape_with_browser(url: str, timeout: int = 15) -> dict:
                     await smart_wait_for_price(page, hard_timeout_ms=3000)
 
             elif "flipkart" in hostname:
+                # After "commit", wait for the price selector to appear
                 try:
-                    await page.wait_for_selector(".Nx9bqj, ._30jeq3, [class*='pdp-price']", timeout=7000)
+                    await page.wait_for_selector(".Nx9bqj, ._30jeq3, [class*='pdp-price'], script[type='application/ld+json']", timeout=7000)
                 except Exception:
                     await smart_wait_for_price(page, hard_timeout_ms=2000)
 
@@ -374,6 +405,21 @@ async def scrape_with_browser(url: str, timeout: int = 15) -> dict:
                     await page.wait_for_selector("[class*='offer-price'], [class*='selling-price']", timeout=7000)
                 except Exception:
                     await smart_wait_for_price(page, hard_timeout_ms=2500)
+
+            elif "tirabeauty" in hostname:
+                # networkidle already waited; now check for price selector
+                try:
+                    await page.wait_for_selector("[class*='sellingPrice'], [class*='selling-price'], [data-testid='selling-price']", timeout=5000)
+                except Exception:
+                    await smart_wait_for_price(page, hard_timeout_ms=3000)
+
+            elif "apollopharmacy" in hostname:
+                # Angular: slower hydration than React. Don't use networkidle
+                # (analytics keep network busy 10+ seconds).
+                try:
+                    await page.wait_for_selector("[class*='price'], [class*='Price'], [class*='discountPrice']", timeout=6000)
+                except Exception:
+                    await smart_wait_for_price(page, hard_timeout_ms=3000)
 
             else:
                 # Generic: wait for any price indicator
@@ -497,6 +543,56 @@ async def scrape_with_browser(url: str, timeout: int = 15) -> dict:
                     }
                 }
 
+                // TiraBeauty — Next.js with deep __NEXT_DATA__ nesting
+                if (hostname.includes('tirabeauty')) {
+                    try {
+                        const nd = JSON.parse(document.getElementById('__NEXT_DATA__')?.textContent || '{}');
+                        const pdp = nd?.props?.pageProps?.productDetails
+                                 || nd?.props?.pageProps?.product
+                                 || nd?.props?.pageProps?.pdpData;
+                        const sp = pdp?.price?.sp || pdp?.sellingPrice || pdp?.discountedPrice
+                                || pdp?.priceDetails?.sp;
+                        if (sp) {
+                            const p = parseFloat(String(sp).replace(/,/g, ''));
+                            if (p > 10) return { price: p, mrp: pdp?.price?.mrp || pdp?.mrp || null, title: pdp?.name || document.title };
+                        }
+                    } catch {}
+                    // Fallback: CSS selector (TiraBeauty stable classes)
+                    const tEl = document.querySelector('[class*="selling-price"], [class*="sellingPrice"], [data-testid="selling-price"]');
+                    if (tEl) {
+                        const p = parseINR(tEl.textContent);
+                        if (p) return { price: p, mrp: null, title: document.title };
+                    }
+                }
+
+                // ApolloPharmacy — Angular + Shadow DOM
+                if (hostname.includes('apollopharmacy')) {
+                    // Shadow DOM piercing helper
+                    function deepQuery(root, selector) {
+                        let el = root.querySelector(selector);
+                        if (el) return el;
+                        const hosts = root.querySelectorAll('*');
+                        for (const host of hosts) {
+                            if (host.shadowRoot) {
+                                el = deepQuery(host.shadowRoot, selector);
+                                if (el) return el;
+                            }
+                        }
+                        return null;
+                    }
+                    const aEl = deepQuery(document, '[class*="discounted-price"], [class*="DiscountPrice"], [class*="sp-price"], .product-price, [class*="finalPrice"]');
+                    if (aEl) {
+                        const p = parseINR(aEl.textContent);
+                        if (p) return { price: p, mrp: null, title: document.title };
+                    }
+                    // Apollo also embeds price in window state
+                    try {
+                        const str = JSON.stringify(window.__APP_STATE__ || window.__REDUX_STATE__ || {});
+                        const m = str.match(/"(?:sp|sellingPrice|discountedPrice)"\\s*:\\s*(\\d+\\.?\\d*)/i);
+                        if (m) return { price: parseFloat(m[1]), mrp: null, title: document.title };
+                    } catch {}
+                }
+
                 // Generic window state keys
                 for (const key of ['__PRELOADED_STATE__', '__NEXT_DATA__', '__NUXT__', '__nuxt__']) {
                     try {
@@ -574,7 +670,19 @@ async def scrape_with_browser(url: str, timeout: int = 15) -> dict:
 
     except Exception as e:
         result["error"] = str(e)[:200]
-        print(f"[Browser] ❌ {url[:65]} → {str(e)[:80]}")
+        # Capture partial HTML even on timeout — the page likely has
+        # JSON-LD / meta tags already. The TS-side extractPriceFromProductPage
+        # will pick up prices from this partial HTML.
+        try:
+            result["html"] = await page.content()
+            result["title"] = await page.title()
+            html_len = len(result["html"])
+            if html_len > 500:
+                print(f"[Browser] ❌ {url[:65]} → timeout but captured {html_len} chars HTML")
+            else:
+                print(f"[Browser] ❌ {url[:65]} → {str(e)[:80]}")
+        except Exception:
+            print(f"[Browser] ❌ {url[:65]} → {str(e)[:80]}")
         return result
 
     # ── Tier 2: proxy retry (only on detected block) ─────────────────────

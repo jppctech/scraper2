@@ -47,7 +47,7 @@ from typing import AsyncIterator, Optional
 # Default concurrent contexts. Each Patchright context holds ~80–120 MB RSS,
 # so 10 contexts ≈ 1–1.2 GB steady state. Override via BROWSER_POOL_SIZE env
 # in main.py at warmup time.
-DEFAULT_POOL_SIZE = 4
+DEFAULT_POOL_SIZE = 10
 
 # Recycle a context after this many use cycles. Bounds memory growth from
 # DOM/storage accumulation. 200 is conservative; raise once we've measured.
@@ -83,6 +83,7 @@ class PooledPage:
     """A single (context, page) pair tracked by the pool."""
     context: object  # patchright BrowserContext
     page: object     # patchright Page
+    cdp_session: object = None  # CDP session for per-request overrides
     use_count: int = 0
     created_at: float = field(default_factory=time.time)
     is_broken: bool = False
@@ -135,7 +136,11 @@ class BrowserPool:
             from patchright.async_api import async_playwright
 
             self._playwright_ctx = await async_playwright().start()
+            # Use real Chrome (not Chromium) — its TLS cipher ordering
+            # matches Akamai's JA4 whitelist, fixing Myntra/Flipkart blocks.
+            # Falls back to Chromium automatically if Chrome isn't installed.
             self._browser = await self._playwright_ctx.chromium.launch(
+                channel="chrome",
                 headless=True,
                 args=[
                     "--no-sandbox",
@@ -306,12 +311,14 @@ class BrowserPool:
         # IPC bridge to Python — typically saves 200–400 ms per page vs
         # the equivalent page.route() handlers (each blocked request in
         # page.route still flies through the WebSocket-based protocol).
-        # We block CSS too: price extraction reads JSON-LD / __NEXT_DATA__
-        # / DOM text — none of which need stylesheets to be parseable.
+        # CSS is blocked by default (speeds up domcontentloaded by 2-5s).
+        # Flipkart needs CSS for IntersectionObserver — scrape_with_browser
+        # will override setBlockedURLs per-request for Flipkart.
+        cdp_session = None
         try:
-            cdp = await context.new_cdp_session(page)
-            await cdp.send("Network.enable")
-            await cdp.send(
+            cdp_session = await context.new_cdp_session(page)
+            await cdp_session.send("Network.enable")
+            await cdp_session.send(
                 "Network.setBlockedURLs",
                 {
                     "urls": [
@@ -319,7 +326,7 @@ class BrowserPool:
                         "*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp", "*.svg",
                         "*.woff", "*.woff2", "*.ttf", "*.eot", "*.ico",
                         "*.mp4", "*.mp3",
-                        # Stylesheets — safe to drop for price extraction
+                        # Stylesheets — speeds up domcontentloaded significantly
                         "*.css",
                         # Analytics + ad networks — common 5+ s hangs
                         "*google-analytics*", "*googletagmanager*",
@@ -340,7 +347,7 @@ class BrowserPool:
         await page.route(_TRACKER_BLOCK_PATTERN, lambda r: r.abort())
 
         self._created_contexts += 1
-        return PooledPage(context=context, page=page)
+        return PooledPage(context=context, page=page, cdp_session=cdp_session)
 
     async def _destroy_pair(self, pp: PooledPage) -> None:
         try:
