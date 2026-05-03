@@ -1,9 +1,11 @@
 fastapi==0.115.12
 uvicorn==0.34.2
+gunicorn==23.0.0
 curl_cffi==0.7.4
 pydantic==2.11.1
 beautifulsoup4==4.13.4
 python-dotenv==1.1.0
+orjson==3.10.16
 # ----------------------------------------------------------------------------
 # Patchright — drop-in undetected Playwright replacement (same API surface).
 # Patches CDP Runtime.enable / Console.enable / navigator.webdriver / command

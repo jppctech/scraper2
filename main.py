@@ -1,12 +1,15 @@
 """
-curl_cffi Scraper Microservice v4.0
+curl_cffi Scraper Microservice v5.0
 FastAPI service with:
-  - /scrape, /scrape/batch — raw HTML scraping
+  - /scrape, /scrape/batch — raw HTML scraping (async curl_cffi)
+  - /scrape/batch/stream — SSE streaming batch (concurrent static + browser)
   - /search — Google SERP scraping (replaces Jina Search)
   - Webshare proxy fallback on CAPTCHA/block detection
 """
 
 import asyncio
+import concurrent.futures
+import json as json_mod
 import os
 import re
 from typing import Optional
@@ -14,10 +17,13 @@ from urllib.parse import urlparse, urlencode, unquote
 
 from bs4 import BeautifulSoup
 from curl_cffi import requests as curl_requests
-from fastapi import FastAPI
+from curl_cffi.requests import AsyncSession
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import ORJSONResponse, StreamingResponse
 from contextlib import asynccontextmanager
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 import proxy_manager
 import amazon_pa
@@ -26,16 +32,30 @@ import fingerprint_rotator
 
 # ─── App Setup ───────────────────────────────────────────────────────────────
 
+# ─── Module-level shared resources (initialized in lifespan) ─────────────────
+_curl_session: Optional[AsyncSession] = None
+_thread_pool = concurrent.futures.ThreadPoolExecutor(
+    max_workers=20, thread_name_prefix="scraper"
+)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _curl_session
+
     # Startup: Initialize proxy pool from Webshare
     count = await proxy_manager.initialize()
     print(f"[Startup] Proxy pool ready: {count} proxies")
 
+    # Startup: persistent AsyncSession — connection pooling for curl_cffi
+    # max_clients=60 allows 60 concurrent curl handles per worker
+    _curl_session = AsyncSession(max_clients=60)
+    print("[Startup] curl_cffi AsyncSession ready (max_clients=60)")
+
     # Startup: warm up Patchright browser pool so the FIRST scrape doesn't
-    # pay the ~3s Chromium cold-start. Default 10 contexts; tune via the
-    # BROWSER_POOL_SIZE env (lower on small VPS, higher on 16+ GB hosts).
-    pool_size = int(os.getenv("BROWSER_POOL_SIZE", "10"))
+    # pay the ~3s Chromium cold-start. Default 8 contexts per worker;
+    # tune via the BROWSER_POOL_SIZE env.
+    pool_size = int(os.getenv("BROWSER_POOL_SIZE", "8"))
     if pool_size > 0:
         try:
             warmed = await browser_pool.get_pool().warmup(size=pool_size)
@@ -49,13 +69,21 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Shutdown: drain the browser pool cleanly
+    # Shutdown
+    if _curl_session:
+        await _curl_session.close()
     try:
         await browser_pool.get_pool().shutdown()
     except Exception as e:
         print(f"[Shutdown] Browser pool shutdown error: {e}")
+    _thread_pool.shutdown(wait=False)
 
-app = FastAPI(title="Product Analyzer Scraper", version="4.1.0", lifespan=lifespan)
+app = FastAPI(
+    title="Product Analyzer Scraper",
+    version="5.0.0",
+    lifespan=lifespan,
+    default_response_class=ORJSONResponse,
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -388,6 +416,179 @@ def extract_price_from_html(html: str) -> tuple[Optional[float], Optional[str]]:
     return None, None
 
 
+# ─── Async Domain Rate Limiter ──────────────────────────────────────────────
+
+class AsyncDomainBucket:
+    """Async token-bucket rate limiter keyed by hostname."""
+
+    def __init__(self, rate_per_sec: float = 6.0, burst: int = 12) -> None:
+        self._rate = float(rate_per_sec)
+        self._burst = float(burst)
+        self._tokens: dict[str, float] = {}
+        self._last_refill: dict[str, float] = {}
+        self._lock = asyncio.Lock()
+
+    async def acquire(self, host: str) -> float:
+        if not host:
+            return 0.0
+        slept = 0.0
+        while True:
+            async with self._lock:
+                now = asyncio.get_event_loop().time()
+                if host not in self._tokens:
+                    self._tokens[host] = self._burst
+                    self._last_refill[host] = now
+                elapsed = now - self._last_refill[host]
+                self._tokens[host] = min(
+                    self._burst, self._tokens[host] + elapsed * self._rate
+                )
+                self._last_refill[host] = now
+                if self._tokens[host] >= 1.0:
+                    self._tokens[host] -= 1.0
+                    return slept
+                deficit = 1.0 - self._tokens[host]
+                wait = deficit / self._rate
+            await asyncio.sleep(wait)
+            slept += wait
+
+
+_async_domain_bucket = AsyncDomainBucket(
+    rate_per_sec=float(os.getenv("DOMAIN_RATE_LIMIT_PER_SEC", "6")),
+    burst=int(os.getenv("DOMAIN_RATE_LIMIT_BURST", "12")),
+)
+
+
+# ─── Async Core Scraping ───────────────────────────────────────────────────
+
+
+async def scrape_url_async(url: str, timeout: int = 9) -> ScrapeResponse:
+    """
+    True async scrape — no thread blocking, no executor overhead.
+    Uses curl_cffi AsyncSession for network I/O and run_in_threadpool
+    for CPU-bound HTML parsing (BeautifulSoup).
+
+    Tier 1: Direct async request
+    Tier 2: Amazon PA API fallback (sync call in threadpool)
+    Tier 3: Proxy async request
+    """
+    global _curl_session
+
+    if should_skip_url(url):
+        return ScrapeResponse(
+            url=url, status_code=0, html="", content_length=0,
+            success=False, error="Skipped: unsupported domain",
+        )
+
+    is_amazon = amazon_pa.is_amazon_url(url)
+
+    # Per-domain rate limiting (async version)
+    host = ""
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        pass
+    if host:
+        slept = await _async_domain_bucket.acquire(host)
+        if slept > 0.25:
+            print(f"[RateLimit] {host} waited {slept:.2f}s for token")
+
+    # Per-request fingerprint rotation
+    profile = fingerprint_rotator.pick_profile(default=IMPERSONATE_PROFILE)
+    headers = fingerprint_rotator.pick_headers(base=BROWSER_HEADERS)
+
+    # Lazy-init session guard (shouldn't happen if lifespan ran, but safe)
+    if _curl_session is None:
+        _curl_session = AsyncSession(max_clients=60)
+
+    # ── Tier 1: Direct async scrape ──────────────────────────────────────
+    try:
+        direct_timeout = min(timeout, 8)
+        response = await _curl_session.get(
+            url, headers=headers, impersonate=profile,
+            timeout=direct_timeout, allow_redirects=True, max_redirects=5,
+        )
+        html = response.text
+        success = response.status_code == 200 and len(html) > 100
+
+        if success and not proxy_manager.is_blocked(response.status_code, html):
+            price, title = await run_in_threadpool(extract_price_from_html, html)
+            return ScrapeResponse(
+                url=url, status_code=response.status_code,
+                html=html, content_length=len(html),
+                success=success,
+                extracted_price=price,
+                extracted_title=title,
+                used_proxy=False,
+            )
+
+        print(f"[Scraper] 🛡️ Blocked (HTTP {response.status_code}): {url[:80]}")
+
+    except Exception as e:
+        print(f"[Scraper] ⚠️ Direct failed: {url[:60]} — {str(e)[:80]}")
+
+    # ── Tier 2 (Amazon only): PA API fallback ────────────────────────────
+    if is_amazon and amazon_pa.is_configured():
+        print(f"[Scraper] 📦 Trying Amazon PA API for: {url[:60]}")
+        product = await run_in_threadpool(amazon_pa.lookup_from_url, url)
+        if product and product.price:
+            return ScrapeResponse(
+                url=product.url,
+                status_code=200,
+                html=f'<title>{product.title}</title>',
+                content_length=0,
+                success=True,
+                extracted_price=product.price,
+                extracted_title=product.title,
+                used_proxy=False,
+            )
+        print(f"[Scraper] ⚠️ PA API failed, falling through to proxy")
+
+    # ── Tier 3: Proxy async scrape ───────────────────────────────────────
+    if not proxy_manager.is_available():
+        return ScrapeResponse(
+            url=url, status_code=0, html="", content_length=0,
+            success=False, error="Blocked and no proxies available",
+        )
+
+    proxy_url = proxy_manager.get_next_proxy()
+    if proxy_url:
+        try:
+            proxy_timeout = min(timeout, 10)
+            response = await _curl_session.get(
+                url, headers=headers, impersonate=profile,
+                timeout=proxy_timeout, allow_redirects=True, max_redirects=5,
+                proxy=proxy_url,
+            )
+            html = response.text
+            success = response.status_code == 200 and len(html) > 100
+
+            if success and not proxy_manager.is_blocked(response.status_code, html):
+                proxy_manager.report_success(proxy_url)
+                price, title = await run_in_threadpool(extract_price_from_html, html)
+                print(f"[Scraper] ✅ Proxy success: {url[:60]}")
+                return ScrapeResponse(
+                    url=url, status_code=response.status_code,
+                    html=html, content_length=len(html),
+                    success=success,
+                    extracted_price=price,
+                    extracted_title=title,
+                    used_proxy=True,
+                )
+            else:
+                proxy_manager.report_failure(proxy_url)
+                print(f"[Scraper] 🛡️ Proxy also blocked: {url[:60]}")
+
+        except Exception as e:
+            proxy_manager.report_failure(proxy_url)
+            print(f"[Scraper] ❌ Proxy error: {str(e)[:80]}")
+
+    return ScrapeResponse(
+        url=url, status_code=0, html="", content_length=0,
+        success=False, error="All scrape attempts failed",
+        used_proxy=True,
+    )
+
+
 # ─── Google Search Scraper ──────────────────────────────────────────────────
 
 
@@ -575,9 +776,9 @@ def extract_price_from_text(text: str) -> Optional[float]:
 
 
 @app.get("/health", response_model=HealthResponse)
-async def health_check():
+async def health_check() -> HealthResponse:
     return HealthResponse(
-        status="ok", version="4.1.0",
+        status="ok", version="5.0.0",
         impersonate_profile=IMPERSONATE_PROFILE,
         proxy_stats=proxy_manager.get_stats(),
         browser_pool=browser_pool.get_pool().stats(),
@@ -585,26 +786,39 @@ async def health_check():
 
 
 @app.post("/scrape", response_model=ScrapeResponse)
-async def scrape(request: ScrapeRequest):
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
-        None, scrape_url_sync, request.url, request.timeout,
-    )
+async def scrape(request: ScrapeRequest) -> ScrapeResponse:
+    try:
+        return await asyncio.wait_for(
+            scrape_url_async(request.url, request.timeout),
+            timeout=request.timeout + 3,  # 3s grace over caller's budget
+        )
+    except asyncio.TimeoutError:
+        return ScrapeResponse(
+            url=request.url, status_code=0, html="",
+            content_length=0, success=False,
+            error="Server-side timeout",
+        )
 
 
 @app.post("/scrape/batch", response_model=BatchScrapeResponse)
-async def scrape_batch(request: BatchScrapeRequest):
-    loop = asyncio.get_event_loop()
+async def scrape_batch(request: BatchScrapeRequest) -> BatchScrapeResponse:
     semaphore = asyncio.Semaphore(MAX_BATCH_CONCURRENCY)
 
-    async def scrape_with_sem(url: str) -> ScrapeResponse:
+    async def bounded(url: str) -> ScrapeResponse:
         async with semaphore:
-            return await loop.run_in_executor(
-                None, scrape_url_sync, url, request.timeout,
-            )
+            return await scrape_url_async(url, request.timeout)
 
-    tasks = [scrape_with_sem(url) for url in request.urls]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    # Per-request safety timeout: total batch budget = per-URL timeout + 5s
+    batch_timeout = request.timeout + 5
+
+    async def run_batch():
+        tasks = [bounded(url) for url in request.urls]
+        return await asyncio.gather(*tasks, return_exceptions=True)
+
+    try:
+        results = await asyncio.wait_for(run_batch(), timeout=batch_timeout)
+    except asyncio.TimeoutError:
+        results = []
 
     processed: list[ScrapeResponse] = []
     for i, result in enumerate(results):
@@ -616,6 +830,14 @@ async def scrape_batch(request: BatchScrapeRequest):
         else:
             processed.append(result)
 
+    # Pad any missing results (from timeout)
+    while len(processed) < len(request.urls):
+        idx = len(processed)
+        processed.append(ScrapeResponse(
+            url=request.urls[idx], status_code=0, html="",
+            content_length=0, success=False, error="Batch timeout",
+        ))
+
     successful = sum(1 for r in processed if r.success)
     return BatchScrapeResponse(
         results=processed, total=len(processed),
@@ -623,24 +845,143 @@ async def scrape_batch(request: BatchScrapeRequest):
     )
 
 
-@app.post("/search", response_model=SearchResponse)
-async def search(request: SearchRequest):
-    """Search Google and return structured results with URLs, titles, prices."""
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
-        None, google_search_sync, request.query, request.num_results,
+# ─── SSE Streaming Batch ────────────────────────────────────────────────────
+# Fires static (curl_cffi) and browser (Patchright) scrapes concurrently from
+# t=0 and streams each result the moment it finishes. The Next.js caller can
+# process results incrementally instead of waiting for the entire batch.
+
+JS_HEAVY_DOMAINS = {"myntra", "flipkart", "meesho", "nykaa", "ajio", "bigbasket", "jiomart"}
+
+
+def _is_js_heavy(url: str) -> bool:
+    host = urlparse(url).netloc.lower()
+    return any(d in host for d in JS_HEAVY_DOMAINS)
+
+
+@app.post("/scrape/batch/stream")
+async def batch_stream(request: BatchScrapeRequest, http_request: Request):
+    """
+    Stream scrape results as SSE — client receives each URL result the moment
+    it's done. Routes each URL to either async curl_cffi or Patchright browser
+    based on domain, fires ALL concurrently from t=0.
+    """
+    from browser_scraper import scrape_with_browser
+
+    async def generate():
+        tasks: dict[asyncio.Task, str] = {}
+        for url in request.urls:
+            if _is_js_heavy(url):
+                task = asyncio.create_task(
+                    _safe_browser_scrape(url, request.timeout)
+                )
+            else:
+                task = asyncio.create_task(
+                    scrape_url_async(url, request.timeout)
+                )
+            tasks[task] = url
+
+        completed = 0
+        total = len(tasks)
+
+        for coro in asyncio.as_completed(tasks.keys()):
+            # Stop wasting resources if client disconnected
+            if await http_request.is_disconnected():
+                for t in tasks:
+                    t.cancel()
+                break
+            try:
+                result = await coro
+                completed += 1
+                # Normalize result shape (ScrapeResponse or browser dict)
+                if isinstance(result, ScrapeResponse):
+                    payload = {
+                        "url": result.url, "success": result.success,
+                        "html": result.html, "content_length": result.content_length,
+                        "extracted_price": result.extracted_price,
+                        "extracted_title": result.extracted_title,
+                        "status_code": result.status_code,
+                        "used_proxy": result.used_proxy,
+                        "completed": completed, "total": total,
+                    }
+                else:
+                    # Browser scrape returns a dict
+                    payload = {
+                        "url": result.get("url", ""),
+                        "success": result.get("success", False),
+                        "html": result.get("html", ""),
+                        "content_length": len(result.get("html", "")),
+                        "extracted_price": result.get("price"),
+                        "extracted_title": result.get("title"),
+                        "status_code": 200 if result.get("success") else 0,
+                        "used_proxy": result.get("used_proxy", False),
+                        "completed": completed, "total": total,
+                    }
+                yield f"data: {json_mod.dumps(payload)}\n\n"
+            except Exception as e:
+                completed += 1
+                yield f"data: {json_mod.dumps({'error': str(e)[:200], 'completed': completed, 'total': total})}\n\n"
+
+        yield f"data: {json_mod.dumps({'event': 'end', 'completed': completed, 'total': total, 'done': True})}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",    # CRITICAL: disables Nginx buffering
+            "Connection": "keep-alive",
+        },
     )
 
 
-@app.post("/scrape/browser")
-async def scrape_browser_endpoint(request: ScrapeRequest):
-    """Scrape a JS-heavy site using Playwright and return rendered HTML and extracted prices."""
+async def _safe_browser_scrape(url: str, timeout: int = 10) -> dict:
+    """Browser scrape with safety timeout wrapper."""
     from browser_scraper import scrape_with_browser
     try:
-        result = await scrape_with_browser(request.url, request.timeout)
-        return result
+        return await asyncio.wait_for(
+            scrape_with_browser(url, timeout),
+            timeout=timeout + 3,
+        )
+    except asyncio.TimeoutError:
+        return {"url": url, "success": False, "error": "Browser timeout", "html": "",
+                "price": None, "mrp": None, "title": None}
     except Exception as e:
-        return {"url": request.url, "success": False, "error": str(e)}
+        return {"url": url, "success": False, "error": str(e)[:200], "html": "",
+                "price": None, "mrp": None, "title": None}
+
+
+@app.post("/search", response_model=SearchResponse)
+async def search(request: SearchRequest) -> SearchResponse:
+    """Search Google and return structured results with URLs, titles, prices."""
+    try:
+        return await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(
+                _thread_pool, google_search_sync, request.query, request.num_results,
+            ),
+            timeout=15,  # hard cap for search
+        )
+    except asyncio.TimeoutError:
+        return SearchResponse(
+            query=request.query, results=[], total=0,
+            success=False, error="Search timeout",
+        )
+
+
+class BrowserScrapeResponse(BaseModel):
+    url: str
+    price: Optional[float] = None
+    mrp: Optional[float] = None
+    title: Optional[str] = None
+    html: str = ""
+    success: bool = False
+    error: Optional[str] = None
+
+
+@app.post("/scrape/browser", response_model=BrowserScrapeResponse)
+async def scrape_browser_endpoint(request: ScrapeRequest) -> BrowserScrapeResponse:
+    """Scrape a JS-heavy site using Patchright and return rendered HTML and extracted prices."""
+    result = await _safe_browser_scrape(request.url, request.timeout)
+    return BrowserScrapeResponse(**result)
 
 
 # ─── Entry Point ─────────────────────────────────────────────────────────────
@@ -657,10 +998,11 @@ if __name__ == "__main__":
 
     port = int(os.getenv("SCRAPER_PORT", "8765"))
     pa_status = "✅ configured" if amazon_pa.is_configured() else "❌ not configured (set AMAZON_PA_ACCESS_KEY, AMAZON_PA_SECRET_KEY, AMAZON_PA_PARTNER_TAG)"
-    print(f"🚀 curl_cffi scraper v4.1 on port {port}")
+    print(f"🚀 curl_cffi scraper v5.0 on port {port}")
     print(f"   Profile: {IMPERSONATE_PROFILE}")
     print(f"   Amazon PA API: {pa_status}")
     print(f"   Fallback: Direct → PA API (Amazon) → Proxy")
-    print(f"   Endpoints: /scrape, /scrape/batch, /search")
+    print(f"   Endpoints: /scrape, /scrape/batch, /scrape/batch/stream, /search, /scrape/browser")
 
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+

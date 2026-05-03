@@ -47,7 +47,7 @@ from typing import AsyncIterator, Optional
 # Default concurrent contexts. Each Patchright context holds ~80–120 MB RSS,
 # so 10 contexts ≈ 1–1.2 GB steady state. Override via BROWSER_POOL_SIZE env
 # in main.py at warmup time.
-DEFAULT_POOL_SIZE = 10
+DEFAULT_POOL_SIZE = 4
 
 # Recycle a context after this many use cycles. Bounds memory growth from
 # DOM/storage accumulation. 200 is conservative; raise once we've measured.
