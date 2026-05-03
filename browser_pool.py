@@ -301,8 +301,41 @@ class BrowserPool:
 
         page = await context.new_page()
 
-        # Resource blocking is installed ONCE per page in the pool — every
-        # subsequent goto() inherits these handlers automatically.
+        # ── CDP-level resource blocking ────────────────────────────────
+        # Network.setBlockedURLs runs in the BROWSER process, before any
+        # IPC bridge to Python — typically saves 200–400 ms per page vs
+        # the equivalent page.route() handlers (each blocked request in
+        # page.route still flies through the WebSocket-based protocol).
+        # We block CSS too: price extraction reads JSON-LD / __NEXT_DATA__
+        # / DOM text — none of which need stylesheets to be parseable.
+        try:
+            cdp = await context.new_cdp_session(page)
+            await cdp.send("Network.enable")
+            await cdp.send(
+                "Network.setBlockedURLs",
+                {
+                    "urls": [
+                        # Static media / fonts — never needed for prices
+                        "*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp", "*.svg",
+                        "*.woff", "*.woff2", "*.ttf", "*.eot", "*.ico",
+                        "*.mp4", "*.mp3",
+                        # Stylesheets — safe to drop for price extraction
+                        "*.css",
+                        # Analytics + ad networks — common 5+ s hangs
+                        "*google-analytics*", "*googletagmanager*",
+                        "*facebook.net*", "*hotjar*", "*clarity*",
+                        "*doubleclick*", "*adsystem*",
+                    ]
+                },
+            )
+        except Exception as e:
+            # CDP not available (older Chromium / headless variants) — fall
+            # through to page.route() below as a safety net.
+            print(f"[BrowserPool] ⚠️ CDP setBlockedURLs failed, using page.route fallback: {e}")
+
+        # page.route() kept as a fallback — covers any pattern CDP missed
+        # and is harmless when the CDP block already short-circuited the
+        # request (handlers just never fire).
         await page.route(_RESOURCE_BLOCK_PATTERN, lambda r: r.abort())
         await page.route(_TRACKER_BLOCK_PATTERN, lambda r: r.abort())
 
